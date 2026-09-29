@@ -18,6 +18,9 @@ class Item:
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
 @dataclass(frozen=True)
+class DoseCorrection:
+    id:int; item_id:int; old_quantity:float; new_quantity:float; reason:str; base_version:int; new_version:int; created_by:str; created_at:str
+@dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
 def require_text(value,field,max_length=2000):

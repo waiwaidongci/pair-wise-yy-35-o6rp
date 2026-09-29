@@ -1,1 +1,91 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>职业辐射剂量与异常事件</h1><p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限</p><p>剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1000px;margin:1.5rem auto;padding:0 1rem;color:#17212b}
+h1{font-size:1.4rem;margin:.2rem 0}.sub{color:#5b6b78;font-size:.9rem;margin:.2rem 0 1rem}
+.bar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem}
+select,input,textarea,button{font:inherit;padding:.45rem .6rem;border:1px solid #c4cdd5;border-radius:6px}
+button{cursor:pointer;background:#1f6feb;color:#fff;border-color:#1f6feb}button.secondary{background:#fff;color:#17212b}
+.grid{display:grid;grid-template-columns:320px 1fr;gap:1rem}@media(max-width:760px){.grid{grid-template-columns:1fr}}
+.panel{border:1px solid #d7dee5;border-radius:10px;padding:.9rem;background:#fff}
+.panel h2{font-size:1rem;margin:0 0 .6rem}.item{padding:.55rem .6rem;border:1px solid #e3e8ee;border-radius:8px;margin-bottom:.5rem;cursor:pointer}
+.item.active{border-color:#1f6feb;background:#f0f6ff}.item .t{font-weight:600}.item .m{color:#5b6b78;font-size:.8rem;margin-top:.2rem}
+table{border-collapse:collapse;width:100%;font-size:.88rem}td,th{border:1px solid #e3e8ee;padding:.4rem .5rem;text-align:left}th{background:#f4f7f9}
+.badge{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.75rem;background:#eef2f6}
+.badge.warn{background:#fff0e6;color:#b3541e}.badge.bad{background:#ffe9e9;color:#b42318}.badge.ok{background:#e6f4ea;color:#1e7e34}
+label{display:block;font-size:.82rem;color:#5b6b78;margin:.6rem 0 .2rem}.row{display:flex;gap:.6rem}.row>div{flex:1}
+.msg{margin-top:.7rem;padding:.55rem .7rem;border-radius:8px;font-size:.85rem;display:none}.msg.err{background:#ffe9e9;color:#b42318}.msg.ok{background:#e6f4ea;color:#1e7e34}
+.hist td{font-size:.82rem}.muted{color:#84919c;font-size:.8rem}
+</style></head><body>
+<h1>职业辐射剂量与异常事件</h1>
+<p class="sub">登记监测读数并管理超限调查、医学随访；剂量填错时可在详情页提交更正，系统保留新旧值并按新读数重算优先级、期限与调查要求。</p>
+<div class="bar">
+  <label style="margin:0">操作人<input id="actor" value="dosimetrist-a" style="width:130px"></label>
+  <label style="margin:0">角色
+    <select id="role"><option value="dosimetrist">dosimetrist（剂量员，可更正）</option><option value="radiation_officer">radiation_officer</option><option value="health_physicist">health_physicist</option><option value="viewer">viewer</option></select>
+  </label>
+  <button class="secondary" onclick="loadItems()">刷新列表</button>
+  <span id="who" class="muted"></span>
+</div>
+<div class="grid">
+  <div class="panel"><h2>事件列表</h2><div id="list"><span class="muted">加载中…</span></div></div>
+  <div class="panel"><h2>事件详情</h2><div id="detail"><span class="muted">请选择左侧事件。</span></div></div>
+</div>
+<script>
+let ITEMS=[],CURRENT=null;
+function h(x){return String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function headers(){return {'X-Actor':actor.value,'X-Role':role.value,'Content-Type':'application/json'}}
+function sevBadge(s){const m={low:'',elevated:'warn',high:'bad',critical:'bad'};return `<span class="badge ${m[s]||''}">${h(s)}</span>`}
+async function api(path,opt){const r=await fetch(path,{...opt,headers:headers()});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.message||('HTTP '+r.status));return j}
+async function loadItems(){
+  who.textContent=`当前身份：${h(actor.value)} / ${h(role.value)}`;
+  const {items}=await api('/api/items');ITEMS=items;
+  list.innerHTML=items.map(i=>`<div class="item ${CURRENT===i.id?'active':''}" onclick="openItem(${i.id})"><div class="t">#${i.id} ${h(i.title)} ${sevBadge(i.severity)}</div><div class="m">读数 ${i.quantity} / 阈值 ${i.threshold} · ${h(i.status)} · v${i.version} · 优先级 ${i.priority}</div></div>`).join('')||'<span class="muted">暂无事件</span>';
+  if(CURRENT&&items.some(i=>i.id===CURRENT))openItem(CURRENT);
+}
+async function openItem(id){
+  CURRENT=id;loadItemsSilent();
+  const it=await api(`/api/items/${id}`);
+  const [{records},{corrections}]=await Promise.all([api(`/api/items/${id}/records`),api(`/api/items/${id}/corrections`)]);
+  const esc=it.escalation_required?`<span class="badge bad">必须调查</span>`:`<span class="badge ok">无需强制调查</span>`;
+  const canCorrect=role.value==='dosimetrist';
+  detail.innerHTML=`
+    <table>
+      <tr><th>编号</th><td>#${it.id}（${h(it.external_ref||'-')}） · v${it.version}</td></tr>
+      <tr><th>标题/描述</th><td>${h(it.title)}<br><span class="muted">${h(it.description)}</span></td></tr>
+      <tr><th>状态</th><td>${h(it.status)}</td></tr>
+      <tr><th>当前读数</th><td><b>${it.quantity}</b> / 调查阈值 ${it.threshold}</td></tr>
+      <tr><th>严重度</th><td>${sevBadge(it.severity)}</td></tr>
+      <tr><th>优先级</th><td>${it.priority} / 10（按新读数重算）</td></tr>
+      <tr><th>响应期限</th><td>${it.deadline_hours} 小时（按新读数重算）</td></tr>
+      <tr><th>调查要求</th><td>${esc}</td></tr>
+    </table>
+    <h2 style="margin-top:1rem">更正剂量</h2>
+    ${canCorrect?`
+      <p class="muted">提交后保留新旧值；调查/随访退回待复评；已关闭事件保留关闭记录并生成复评待办。须填写当前版本号。</p>
+      <div class="row"><div><label>新读数 *</label><input id="nq" type="number" step="any" value="${it.quantity}"></div>
+      <div><label>当前版本 *</label><input id="ver" type="number" value="${it.version}"></div></div>
+      <label>更正原因 *</label><textarea id="reason" rows="2" style="width:100%" placeholder="如：人员编号串号 / 设备校准偏差 / 单位换算错误"></textarea>
+      <div class="bar" style="margin:.7rem 0 0"><button onclick="submitCorrection(${it.id})">提交更正</button><span id="cmsg" class="msg"></span></div>`
+      :`<p class="muted">仅 dosimetrist 可提交更正；当前角色（${h(role.value)}）只读。</p>`}
+    <h2 style="margin-top:1rem">更正历史（${corrections.length}）</h2>
+    <table class="hist"><tr><th>#</th><th>旧读数</th><th>新读数</th><th>原因</th><th>版本</th><th>操作人</th><th>时间(UTC)</th></tr>
+      ${corrections.map(c=>`<tr><td>${c.id}</td><td>${c.old_quantity}</td><td><b>${c.new_quantity}</b></td><td>${h(c.reason)}</td><td>v${c.base_version}→v${c.new_version}</td><td>${h(c.created_by)}</td><td>${h(c.created_at)}</td></tr>`).join('')||'<tr><td colspan="7" class="muted">尚无更正</td></tr>'}</table>
+    <h2 style="margin-top:1rem">事项与待办（${records.length}）</h2>
+    <table class="hist"><tr><th>#</th><th>类型</th><th>说明</th><th>状态</th><th>操作人</th></tr>
+      ${records.map(r=>`<tr><td>${r.id}</td><td>${r.kind==='re_review'?'<span class="badge warn">复评待办</span>':h(r.kind)}</td><td>${h(r.detail)}</td><td>${h(r.status)}</td><td>${h(r.created_by)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">暂无记录</td></tr>'}</table>`;
+}
+function loadItemsSilent(){return loadItems().catch(e=>{})}
+async function submitCorrection(id){
+  const msg=document.getElementById('cmsg');msg.style.display='none';
+  const payload={new_quantity:parseFloat(nq.value),reason:reason.value.trim(),expected_version:parseInt(ver.value,10)};
+  try{
+    const it=await api(`/api/items/${id}/correction`,{method:'POST',body:JSON.stringify(payload)});
+    msg.className='msg ok';msg.style.display='block';
+    msg.textContent=`已更正：${payload.new_quantity}（v${it.version}）· ${it.status==='reviewing'?'已退回待复评':'状态不变'} · 优先级 ${it.priority} · ${it.escalation_required?'必须调查':'无需强制调查'}`+(it.reopened?' · 已生成复评待办，关闭记录保留':'');
+    await openItem(id);
+  }catch(e){
+    msg.className='msg err';msg.style.display='block';
+    msg.textContent=(e.message||'更正失败')+'——该变更未保存，请刷新版本后重试。';
+  }
+}
+loadItems().catch(e=>{list.textContent='加载失败：'+e.message});
+</script></body></html>

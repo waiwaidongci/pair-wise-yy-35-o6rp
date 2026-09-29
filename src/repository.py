@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (CORRECTION_RETURN_STATES, ENTITY, ID_PREFIX,
+                    RE_RECORD_KIND, STATES, TERMINAL_STATES)
 
 
 class Repository:
@@ -53,6 +54,17 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS dose_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    old_quantity REAL NOT NULL,
+                    new_quantity REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    base_version INTEGER NOT NULL,
+                    new_version INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +135,92 @@ class Repository:
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
+    def correct_quantity(self, item_id: int, new_quantity: float, reason: str,
+                         expected_version: int, new_status: Optional[str],
+                         derived: Dict[str, Any], actor: str
+                         ) -> Dict[str, Any]:
+        """Apply a dose correction atomically.
+
+        Updates quantity/version (optimistic on expected_version), persists both
+        old and new values, rolls active or closed events back to review, opens a
+        re-review todo for previously closed events and appends the audit entry
+        inside one transaction so the change is either fully recorded or absent.
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            current = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("项目不存在")
+            if int(current["version"]) != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            old_quantity = float(current["quantity"])
+            old_status = current["status"]
+            new_version = expected_version + 1
+            cur = self.conn.execute(
+                """UPDATE items SET quantity=?, status=?, version=version+1,
+                       updated_at=? WHERE id=? AND version=?""",
+                (new_quantity, new_status or old_status, now,
+                 item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+            corr_cur = self.conn.execute(
+                """INSERT INTO dose_corrections(item_id, old_quantity, new_quantity,
+                   reason, base_version, new_version, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, old_quantity, new_quantity, reason,
+                 expected_version, new_version, actor, now),
+            )
+            correction_id = int(corr_cur.lastrowid)
+            reopened = old_status in TERMINAL_STATES
+            returned_to_review = old_status in CORRECTION_RETURN_STATES
+            todo_id: Optional[int] = None
+            if reopened:
+                todo_cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status,
+                       external_ref, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, RE_RECORD_KIND, reason, "open",
+                     f"RE-CORR-{correction_id}", actor, now),
+                )
+                todo_id = int(todo_cur.lastrowid)
+            event = self._insert_audit("correct_dose", ENTITY, item_id, actor, {
+                "correction_id": correction_id,
+                "old_quantity": old_quantity,
+                "new_quantity": new_quantity,
+                "reason": reason,
+                "base_version": expected_version,
+                "new_version": new_version,
+                "from_status": old_status,
+                "to_status": new_status or old_status,
+                "returned_to_review": returned_to_review,
+                "reopened": reopened,
+                "re_review_record_id": todo_id,
+                "priority": derived["priority"],
+                "deadline_hours": derived["deadline_hours"],
+                "escalation_required": derived["escalation_required"],
+            })
+        result = self.get_item(item_id)
+        result["correction_id"] = correction_id
+        result["old_quantity"] = old_quantity
+        result["old_status"] = old_status
+        result["returned_to_review"] = returned_to_review
+        result["reopened"] = reopened
+        result["re_review_record_id"] = todo_id
+        result["audit_id"] = event["id"]
+        return result
+
+    def list_corrections(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
@@ -157,24 +255,28 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    def _insert_audit(self, action: str, entity_type: str, entity_id: int,
+                      actor: str, detail: dict) -> Dict[str, Any]:
+        """Insert an audit event inside the caller's open transaction/lock."""
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
-            )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
-        return event
+            return self._insert_audit(action, entity_type, entity_id, actor, detail)
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
+from .rules import (AUDIT_ROLES, CORRECTION_RETURN_STATES, CORRECTION_ROLES,
+                    CREATE_ROLES, ENTITY, RECORD_ROLES, REOPENED_STATUS, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
                     priority_score, response_deadline_hours, role_for_transition,
                     validate_transition)
@@ -75,9 +77,48 @@ class Service:
         })
         return self.enrich(updated)
 
+    def correct_dose(self, item_id: int, payload: Dict[str, Any], actor: str,
+                     role: str) -> Dict[str, Any]:
+        ensure_role(role, CORRECTION_ROLES)
+        actor = require_text(actor, "actor", 100)
+        new_quantity = require_number(payload.get("new_quantity"), "new_quantity")
+        reason = require_text(payload.get("reason"), "reason")
+        expected_version = payload.get("expected_version")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) \
+                or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+        item = self.repository.get_item(item_id)
+        if item["version"] != expected_version:
+            raise ConflictError("版本冲突，请刷新后重试")
+        if new_quantity == item["quantity"]:
+            raise ValidationError("新读数必须与当前读数不同")
+        # 调查或随访退回待复评；已关闭事件保留关闭记录并重新打开复评。
+        if item["status"] in CORRECTION_RETURN_STATES or item["status"] == "closed":
+            new_status = REOPENED_STATUS
+        else:
+            new_status = item["status"]
+        derived = {
+            "priority": priority_score(
+                item["severity"], new_quantity, item["threshold"]),
+            "deadline_hours": response_deadline_hours(
+                item["severity"], new_quantity, item["threshold"]),
+            "escalation_required": escalation_required(
+                item["severity"], new_quantity, item["threshold"]),
+        }
+        updated = self.repository.correct_quantity(
+            item_id, new_quantity, reason, expected_version, new_status,
+            derived, actor)
+        return self.enrich(updated)
+
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
-        return self.enrich(self.repository.get_item(item_id))
+        item = self.enrich(self.repository.get_item(item_id))
+        item["corrections"] = self.repository.list_corrections(item_id)
+        return item
+
+    def list_corrections(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_corrections(item_id)
 
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)
