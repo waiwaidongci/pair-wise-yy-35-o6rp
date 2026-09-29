@@ -1,1 +1,102 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>职业辐射剂量与异常事件</h1><p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限</p><p>剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>职业辐射剂量与异常事件</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#17212b}
+pre{background:#f4f7f9;padding:1rem;overflow:auto}
+button{padding:.45rem .9rem;cursor:pointer}
+.card{border:1px solid #d7dee5;border-radius:8px;padding:1rem;margin:.75rem 0}
+.muted{color:#5b6b7b;font-size:.9em}
+label{display:block;margin:.5rem 0 .2rem;font-size:.9em}
+input,textarea,select{width:100%;padding:.45rem;box-sizing:border-box;border:1px solid #b9c4cd;border-radius:4px}
+table{border-collapse:collapse;width:100%;font-size:.9em}
+td,th{border:1px solid #d7dee5;padding:.35rem .5rem;text-align:left}
+.error{color:#b3261e}
+.ok{color:#1b6e3b}
+</style>
+</head>
+<body>
+<h1>职业辐射剂量与异常事件</h1>
+<p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限。填错读数可直接在详情页<strong>更正剂量</strong>，系统保留新旧值并重算优先级、期限与是否必须调查。</p>
+<div>
+  身份：<select id="role">
+    <option value="dosimetrist">dosimetrist（剂量人员，可更正）</option>
+    <option value="radiation_officer">radiation_officer</option>
+    <option value="health_physicist">health_physicist</option>
+    <option value="viewer">viewer</option>
+  </select>
+  <button onclick="loadItems()">刷新列表</button>
+</div>
+<div id="list"></div>
+<div id="detail"></div>
+
+<script>
+const headers=()=>({'X-Actor':'demo','X-Role':document.getElementById('role').value,'Content-Type':'application/json'});
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+async function loadItems(){
+  const r=await fetch('/api/items',{headers:headers()});
+  const data=await r.json();
+  document.getElementById('detail').innerHTML='';
+  document.getElementById('list').innerHTML='<h2>事件列表</h2>'+(data.items||[]).map(it=>`
+    <div class="card">
+      <strong>#${it.id} ${esc(it.title)}</strong>
+      <span class="muted">状态 ${it.status}｜版本 ${it.version}｜读数 ${it.quantity}/${it.threshold}</span><br>
+      优先级 <strong>${it.priority}</strong>｜期限 ${it.deadline_hours}h｜必须调查：${it.escalation_required?'是':'否'}
+      <div style="margin-top:.5rem"><button onclick="loadDetail(${it.id})">打开详情 / 更正剂量</button></div>
+    </div>`).join('') || '<pre>暂无事件</pre>';
+}
+
+async function loadDetail(id){
+  const r=await fetch('/api/items/'+id,{headers:headers()});
+  const it=await r.json();
+  const corrections=(it.corrections||[]).map(c=>`
+    <tr><td>${c.id}</td><td>v${c.version}</td><td>${c.old_quantity} → ${c.new_quantity}</td>
+    <td>${esc(c.reason)}</td><td>${esc(c.created_by)}</td><td>${c.created_at}</td>
+    <td>${(c.reopened_records||[]).length?('重开记录 '+c.reopened_records.join(',')):''}${c.todo_record_id?('复评待办 #'+c.todo_record_id):''}</td></tr>`).join('');
+  document.getElementById('detail').innerHTML=`
+    <h2>事件详情 #${it.id}</h2>
+    <div class="card">
+      <strong>${esc(it.title)}</strong> — ${esc(it.description)}<br>
+      <span class="muted">状态 ${it.status}｜当前版本 v${it.version}｜当前读数 ${it.quantity}，阈值 ${it.threshold}</span><br>
+      优先级 <strong>${it.priority}</strong>｜期限 ${it.deadline_hours}h｜必须调查：${it.escalation_required?'是':'否'}
+    </div>
+    <div class="card">
+      <h3>更正剂量</h3>
+      <label>新读数 new_quantity</label><input id="q" type="number" step="any" value="${it.quantity}">
+      <label>更正原因 reason</label><textarea id="reason" rows="2" placeholder="例如：复测发现录入错误"></textarea>
+      <label>当前版本 expected_version（他人先提交后会收到版本冲突）</label>
+      <input id="ver" type="number" value="${it.version}">
+      <div style="margin-top:.6rem"><button onclick="submitCorrection(${it.id})">提交更正</button></div>
+      <div id="msg"></div>
+    </div>
+    <div class="card">
+      <h3>更正历史（新旧值均保留）</h3>
+      <table><thead><tr><th>#</th><th>版本</th><th>旧→新</th><th>原因</th><th>操作人</th><th>时间</th><th>联动</th></tr></thead>
+      <tbody>${corrections||'<tr><td colspan="7" class="muted">暂无更正</td></tr>'}</tbody></table>
+    </div>`;
+  window.scrollTo(0,document.body.scrollHeight);
+}
+
+async function submitCorrection(id){
+  const payload={
+    new_quantity:parseFloat(document.getElementById('q').value),
+    reason:document.getElementById('reason').value,
+    expected_version:parseInt(document.getElementById('ver').value,10)
+  };
+  const msg=document.getElementById('msg');
+  const r=await fetch('/api/items/'+id+'/corrections',{method:'POST',headers:headers(),body:JSON.stringify(payload)});
+  const data=await r.json();
+  if(!r.ok){
+    msg.innerHTML=`<p class="error">${r.status===409?'版本冲突：已有他人先提交，请刷新详情后基于新版本重试。':esc(data.message||data.error)}</p>`;
+    return;
+  }
+  msg.innerHTML='<p class="ok">更正已提交，优先级/期限/调查要求已按新读数重算。</p>';
+  loadItems(); loadDetail(id);
+}
+</script>
+</body>
+</html>

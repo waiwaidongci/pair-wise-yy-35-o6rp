@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CORRECT_ROLES, CREATE_ROLES, ENTITY,
+                    RECORD_ROLES, TITLE, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -75,9 +77,58 @@ class Service:
         })
         return self.enrich(updated)
 
+    def correct_dose(self, item_id: int, payload: Dict[str, Any], actor: str,
+                     role: str) -> Dict[str, Any]:
+        """剂量人员更正读数：保留新旧值，按新读数重算优先级/期限/是否必须调查，
+        并把调查或随访退回待复评；已关闭事件保留关闭记录并生成复评待办。"""
+        ensure_role(role, CORRECT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        reason = require_text(payload.get("reason"), "reason")
+        new_quantity = require_number(payload.get("new_quantity"), "new_quantity")
+        expected_version = payload.get("expected_version")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) \
+                or expected_version < 1:
+            raise ValidationError("expected_version必须是正整数")
+
+        before = self.repository.get_item(item_id)
+        if abs(float(before["quantity"]) - new_quantity) < 1e-12:
+            raise ValidationError("new_quantity与当前读数相同，无需更正")
+
+        result = self.repository.apply_dose_correction(
+            item_id, new_quantity, reason, expected_version, actor)
+        updated = result["item"]
+        correction = result["correction"]
+        self.repository.append_audit("correct_dose", ENTITY, item_id, actor, {
+            "correction_id": correction["id"],
+            "version": correction["version"],
+            "old_quantity": correction["old_quantity"],
+            "new_quantity": correction["new_quantity"],
+            "reason": reason,
+            "status_from": correction["old_status"],
+            "status_to": correction["new_status"],
+            "reopened_records": correction["reopened_records"],
+            "todo_record_id": correction["todo_record_id"],
+            "priority": priority_score(
+                updated["severity"], updated["quantity"], updated["threshold"]),
+            "deadline_hours": response_deadline_hours(
+                updated["severity"], updated["quantity"], updated["threshold"]),
+            "escalation_required": escalation_required(
+                updated["severity"], updated["quantity"], updated["threshold"]),
+        })
+        return {
+            "item": self.enrich(updated),
+            "correction": correction,
+        }
+
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
-        return self.enrich(self.repository.get_item(item_id))
+        result = self.enrich(self.repository.get_item(item_id))
+        result["corrections"] = self.repository.list_corrections(item_id)
+        return result
+
+    def list_corrections(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_corrections(item_id)
 
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)

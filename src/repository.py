@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (CONCLUSIVE_RECORD_KINDS, CORRECTION_RESET_STATES, ID_PREFIX,
+                    RE_REVIEW_KIND, STATES, TERMINAL_STATES,
+                    status_after_correction)
 
 
 class Repository:
@@ -54,6 +56,20 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS dose_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    old_quantity REAL NOT NULL,
+                    new_quantity REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    reopened_records TEXT NOT NULL DEFAULT '[]',
+                    todo_record_id INTEGER,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_dose_corrections_item
+                    ON dose_corrections(item_id, id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -122,6 +138,94 @@ class Repository:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def apply_dose_correction(self, item_id: int, new_quantity: float, reason: str,
+                              expected_version: int, actor: str) -> Dict[str, Any]:
+        """原子地应用剂量更正：乐观锁更新读数与版本、重开结论性记录或生成复评待办，
+        并保留新旧值。版本不匹配时抛 ConflictError，不写入任何数据。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            current = self._item(row)
+            if current["version"] != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+
+            old_quantity = float(current["quantity"])
+            old_status = current["status"]
+            new_status = status_after_correction(old_status)
+            cur = self.conn.execute(
+                """UPDATE items SET quantity=?, status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (new_quantity, new_status, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+
+            reopened: List[int] = []
+            todo_record_id: Optional[int] = None
+            kinds = ",".join("?" for _ in CONCLUSIVE_RECORD_KINDS)
+            if old_status in CORRECTION_RESET_STATES:
+                # 退回待复评：基于旧读数的调查/随访结论作废，重开这些记录。
+                reopened = [int(r["id"]) for r in self.conn.execute(
+                    f"""SELECT id FROM records WHERE item_id=? AND kind IN ({kinds})
+                        AND status='closed' ORDER BY id""",
+                    (item_id, *CONCLUSIVE_RECORD_KINDS),
+                ).fetchall()]
+                self.conn.execute(
+                    f"""UPDATE records SET status='open'
+                        WHERE item_id=? AND kind IN ({kinds}) AND status='closed'""",
+                    (item_id, *CONCLUSIVE_RECORD_KINDS),
+                )
+            elif old_status in TERMINAL_STATES:
+                # 已关闭事件保留关闭记录，只生成一条复评待办，不改变关闭状态。
+                ins = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, RE_REVIEW_KIND, f"剂量更正复评待办：{reason}", "open",
+                     None, actor, now),
+                )
+                todo_record_id = int(ins.lastrowid)
+
+            ins = self.conn.execute(
+                """INSERT INTO dose_corrections(item_id, version, old_quantity, new_quantity,
+                   reason, reopened_records, todo_record_id, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item_id, expected_version + 1, old_quantity, new_quantity, reason,
+                 json.dumps(reopened, ensure_ascii=False), todo_record_id, actor, now),
+            )
+            correction_id = int(ins.lastrowid)
+
+        correction = self.get_correction(correction_id)
+        correction["old_status"] = old_status
+        correction["new_status"] = new_status
+        return {"item": self.get_item(item_id), "correction": correction}
+
+    def get_correction(self, correction_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE id=?", (correction_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("更正记录不存在")
+        return self._correction(row)
+
+    @staticmethod
+    def _correction(row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["reopened_records"] = json.loads(result["reopened_records"])
+        return result
+
+    def list_corrections(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [self._correction(row) for row in rows]
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
